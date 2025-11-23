@@ -38,6 +38,12 @@ constexpr int32_t BUFFER_NUM = 2;
 constexpr int32_t GATHER_SECOND_NUM = 2;
 constexpr uint32_t MAX_QUANT_ROW_ONCE = 8;
 constexpr uint32_t QUANT_SPACE_FACTOR = 176 * 1024 / 11;  // 量化使用UB不超过176KB
+
+constexpr uint32_t COMP_CORE_NUM = 24;
+constexpr uint32_t SEND_OTHER_E_CORE_NUM = 16;
+constexpr uint32_t SEND_COUNT_E1_CORE_NUM = COMP_CORE_NUM + SEND_OTHER_E_CORE_NUM;
+constexpr uint32_t RECV_CORE_NUM = 8;
+
 #define OPT_RANK_OFFSET 512
 
 #define CEIL_UP(x) ((x + UB_ALIGN - 1) / UB_ALIGN * UB_ALIGN)
@@ -64,15 +70,6 @@ constexpr uint32_t QUANT_SPACE_FACTOR = 176 * 1024 / 11;  // 量化使用UB不�
 #define TOTAL_COUNT_INDEX 4
 #define GROUP_TOKEN_COUNT 3  // 等于SELF_COUNT_INDEX
 #define GROUP_INFO_SIZE 32
-
-#define REACH_STEP_1_SEND_COUNT
-#define REACH_STEP_2_SEND_TOKEN
-#define REACH_STEP_3_RECV_COUNT
-#define REACH_STEP_4_RECV_TOKEN
-#define REACH_STEP_5_WAIT_RECV_CORE
-#define REACH_STEP_6_GMM1_DEQ_SWIGLU
-#define REACH_STEP_7_UPDATE_INFO
-#define REACH_STEP_8_QUANT
 
 #define SEND_TOKEN_RETURN  // 这个宏好像比较影响性能，待确认
 
@@ -565,7 +562,7 @@ public:
                 AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                                   AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
                 __asm__ __volatile__("");
-                if (groupTokenNumStateTensor.GetValue(0) == coreNumPerGroup * vToCFlag) {
+                if (groupTokenNumStateTensor.GetValue(0) == RECV_CORE_NUM * vToCFlag) {
                     break;
                 }
             }
@@ -675,12 +672,12 @@ public:
     {
         // 计算发送token的数量，并且发送出去
         uint32_t totalExpertNum = sharedExpertRankNum + moeExpertNum;
-        uint32_t sendCountExpertNum = totalExpertNum / sendCoreNum;  // 每个aiv需要处理的专家数
-        uint32_t remainderRankNum = totalExpertNum % sendCoreNum;
-        uint32_t startExpertId = sendCountExpertNum * sendCoreIdx;  // sharedExpertRankNum, 每个aiv发送的起始rankid
-        if (sendCoreIdx < remainderRankNum) {  // 前remainderRankNum个aiv需要多发1个卡的数据
+        uint32_t sendCountExpertNum = totalExpertNum / sendE1CoreNum;  // 每个aiv需要处理的专家数
+        uint32_t remainderRankNum = totalExpertNum % sendE1CoreNum;
+        uint32_t startExpertId = sendCountExpertNum * sendE1CoreIdx;  // sharedExpertRankNum, 每个aiv发送的起始rankid
+        if (sendE1CoreIdx < remainderRankNum) {  // 前remainderRankNum个aiv需要多发1个卡的数据
             sendCountExpertNum += 1;
-            startExpertId += sendCoreIdx;
+            startExpertId += sendE1CoreIdx;
         } else {
             startExpertId += remainderRankNum;
         }
@@ -786,7 +783,7 @@ public:
     void SendToShareExprt(GM_ADDR gmX, GM_ADDR gmX1, GM_ADDR gmX1Scale)
     {
         // 给共享专家发送token
-        uint32_t newAivId = sendCoreIdx - sendToMoeAivNum;
+        uint32_t newAivId = sendE1CoreIdx - sendToMoeAivNum;
         uint32_t sendTokenNum = axisBS / sendToShareAivNum;       // 每个aiv需要发送的token数
         uint32_t remainderTokenNum = axisBS % sendToShareAivNum;  // 余数
         uint32_t startTokenId = sendTokenNum * newAivId;          // 每个aiv发送时的起始rankid
@@ -883,15 +880,16 @@ public:
     }
 
     ACT_DEVICE
-    void SendToMoeExprt(GM_ADDR gmX, GM_ADDR gmExpandIdx)
+    void SendToMoeExprt(GM_ADDR gmX, GM_ADDR gmExpandIdx, bool sendToE1, uint64_t subUbOffset)
     {
         // 给路由专家发送token
         uint32_t sendTokenNum = expertIdsCnt / sendToMoeAivNum;
         uint32_t remainderTokenNum = expertIdsCnt % sendToMoeAivNum;
-        uint32_t startTokenId = sendTokenNum * sendCoreIdx;
-        if (sendCoreIdx < remainderTokenNum) {
+        uint32_t curSendCoreIdx = sendToE1 ? sendE1CoreIdx : sendOtherCoreIdx
+        uint32_t startTokenId = sendTokenNum * curSendCoreIdx;
+        if (curSendCoreIdx < remainderTokenNum) {
             sendTokenNum += 1;
-            startTokenId += sendCoreIdx;
+            startTokenId += curSendCoreIdx;
         } else {
             startTokenId += remainderTokenNum;
         }
@@ -903,8 +901,8 @@ public:
 #else
         if (startTokenId < expertIdsCnt) {
 #endif
-        AscendC::LocalTensor<int32_t> expertCountTensor = (resource.ubBuf.template GetBufferByByte<int32_t>(ubOffset));
-        ubOffset += CEIL_UP(expertIdsCnt * sizeof(int32_t));
+        AscendC::LocalTensor<int32_t> expertCountTensor = (resource.ubBuf.template GetBufferByByte<int32_t>(subUbOffset));
+        subUbOffset += CEIL_UP(expertIdsCnt * sizeof(int32_t));
         AscendC::Duplicate(expertCountTensor, (int32_t)0, expertIdsCnt);  // 清零
         AscendC::SetFlag<AscendC::HardEvent::V_S>(1);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(1);
@@ -916,14 +914,14 @@ public:
         AscendC::GlobalTensor<XType> srcWinGMTensor;  // token输入
         srcWinGMTensor.SetGlobalBuffer((__gm__ XType *)gmX);
 
-        xInTensor[0] = resource.ubBuf.template GetBufferByByte<XType>(ubOffset);
-        ubOffset += CEIL_UP(tokenLength * sizeof(XType));
-        xInTensor[1] = resource.ubBuf.template GetBufferByByte<XType>(ubOffset);
-        ubOffset += CEIL_UP(tokenLength * sizeof(XType));
-        yInt8Tensor[0] = resource.ubBuf.template GetBufferByByte<int8_t>(ubOffset);
-        ubOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
-        yInt8Tensor[1] = resource.ubBuf.template GetBufferByByte<int8_t>(ubOffset);
-        ubOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
+        xInTensor[0] = resource.ubBuf.template GetBufferByByte<XType>(subUbOffset);
+        subUbOffset += CEIL_UP(tokenLength * sizeof(XType));
+        xInTensor[1] = resource.ubBuf.template GetBufferByByte<XType>(subUbOffset);
+        subUbOffset += CEIL_UP(tokenLength * sizeof(XType));
+        yInt8Tensor[0] = resource.ubBuf.template GetBufferByByte<int8_t>(subUbOffset);
+        subUbOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
+        yInt8Tensor[1] = resource.ubBuf.template GetBufferByByte<int8_t>(subUbOffset);
+        subUbOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
         AscendC::GlobalTensor<int8_t> dstWinGMTensor;  // token输出
         // 输入输出开double buffer
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);  // MTE2等MTE3
@@ -931,11 +929,18 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
         uint32_t sendValidTokenIndex = 0;
-        for (uint32_t sendGroupIndex = 0; sendGroupIndex < moeExpertNumPerRank; ++sendGroupIndex) {
+        uint32_t startExpertId = sendToE1 ? 0 : 1;
+        uint32_t endExpertId = sendToE1 ? 1 : moeExpertNum
+        for (uint32_t sendGroupIndex = startExpertId; sendGroupIndex < endExpertId; ++sendGroupIndex) {
             for (uint32_t tokenIndex = startTokenId; tokenIndex < endTokenId; ++tokenIndex) {
                 int32_t dstExpertId = expertIdsTensor_(tokenIndex);
                 if (dstExpertId < 0) {
                     continue;
+                }
+                int32_t curExpertCnt = -1;
+                if ((dstExpertId % moeExpertNumPerRank) == 0 && sendGroupIndex == 1) {  // 给第二个专家发送时，把第一个专家的偏移算出来
+                    CalExpandxIdx(dstExpertId, tokenIndex, curExpertCnt, subUbOffset);
+                    expertCountTensor(tokenIndex - startTokenId) = curExpertCnt;
                 }
                 if ((dstExpertId % moeExpertNumPerRank) != sendGroupIndex) {  // 优先发送指定专家的token
                     continue;
@@ -943,8 +948,8 @@ public:
                 uint32_t index = (sendValidTokenIndex & 1) ? 0 : 1;
                 int32_t eventId = (sendValidTokenIndex & 1) ? 0 : 1;
                 sendValidTokenIndex += 1;
-                int32_t curExpertCnt = 0;
-                CalExpandxIdx(dstExpertId, tokenIndex, curExpertCnt, ubOffset);
+                // int32_t curExpertCnt = 0;
+                CalExpandxIdx(dstExpertId, tokenIndex, curExpertCnt, subUbOffset);
                 expertCountTensor(tokenIndex - startTokenId) = curExpertCnt;
                 uint32_t tempRankId = dstExpertId / moeExpertNumPerRank + sharedExpertRankNum;
                 GM_ADDR rankGM = (__gm__ uint8_t *)(GET_WIND_ADDR_BY_RANK_ID(tempRankId) +
@@ -958,7 +963,7 @@ public:
                 AscendC::DataCopy(xInTensor[index], srcWinGMTensor[tokenIndex / axisK * tokenLength], tokenLength);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
-                QuantToken(xInTensor[index], yInt8Tensor[index], ubOffset);
+                QuantToken(xInTensor[index], yInt8Tensor[index], subUbOffset);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
 
                 AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
@@ -977,20 +982,22 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
 
-        AscendC::GlobalTensor<int32_t> expandIdxGMTensor;
-        expandIdxGMTensor.SetGlobalBuffer((__gm__ int32_t *)gmExpandIdx + startTokenId);
-        AscendC::DataCopyExtParams expertIdsCntParams = {1U, static_cast<uint32_t>(sendTokenNum * sizeof(uint32_t)), 0U,
-                                                         0U, 0U};
-        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
-        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
-        AscendC::DataCopyPad(expandIdxGMTensor, expertCountTensor, expertIdsCntParams);
+        if (!sendToE1) { // 给第二个专家发送时，再拷出偏移量。由于单卡单专家当前不会走深融合，所以此处必定会执行
+            AscendC::GlobalTensor<int32_t> expandIdxGMTensor;
+            expandIdxGMTensor.SetGlobalBuffer((__gm__ int32_t *)gmExpandIdx + startTokenId);
+            AscendC::DataCopyExtParams expertIdsCntParams = {1U, static_cast<uint32_t>(sendTokenNum * sizeof(uint32_t)), 0U,
+                                                            0U, 0U};
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+            AscendC::DataCopyPad(expandIdxGMTensor, expertCountTensor, expertIdsCntParams);
+        }
 #ifndef SEND_TOKEN_RETURN
     }
 #endif
 }
 
 ACT_DEVICE void
-SendCoreFunc(GM_ADDR gmX, GM_ADDR gmExpertIds, GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmExpandIdx)
+SendE1CoreFunc(GM_ADDR gmX, GM_ADDR gmExpertIds, GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmExpandIdx)
 {
     ubOffset = 0;
     expertIdsCnt = axisBS * axisK;
@@ -1010,19 +1017,58 @@ SendCoreFunc(GM_ADDR gmX, GM_ADDR gmExpertIds, GM_ADDR gmX1, GM_ADDR gmX1Scale, 
     CalAndSendTokenCount();
     AscendC::PipeBarrier<PIPE_ALL>();
     if (hasShareExpert) {
-        sendToShareAivNum = sendCoreNum / (axisK + 1);  // 均等分，取整
+        sendToShareAivNum = sendE1CoreNum / (axisK + 1);  // 均等分，取整
         if (sendToShareAivNum == 0) {
             sendToShareAivNum = 1;
         }
     }
-    sendToMoeAivNum = sendCoreNum - sendToShareAivNum;
+    sendToMoeAivNum = sendE1CoreNum - sendToShareAivNum;
 
     AscendC::SetDeqScale((half)1.000000e+00f);
-    if (hasShareExpert && sendCoreIdx >= sendToMoeAivNum) {
+    if (hasShareExpert && sendE1CoreIdx >= sendToMoeAivNum) {
         SendToShareExprt(gmX, gmX1, gmX1Scale);
     } else {
-        SendToMoeExprt(gmX, gmExpandIdx);
+        SendToMoeExprt(gmX, gmExpandIdx, true, ubOffset);
     }
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+ACT_DEVICE void
+SendOtherCoreFunc(GM_ADDR gmX, GM_ADDR gmExpertIds, GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmExpandIdx)
+{
+    // ubOffset = 0;
+    // expertIdsCnt = axisBS * axisK;
+
+    // AscendC::GlobalTensor<int32_t> expertIdsGMTensor_;
+    // expertIdsGMTensor_.SetGlobalBuffer((__gm__ int32_t *)gmExpertIds);
+    // expertIdsTensor_ = (resource.ubBuf.template GetBufferByByte<int32_t>(ubOffset));
+    // ubOffset += CEIL_UP(expertIdsCnt * sizeof(int32_t));
+
+    // AscendC::DataCopyExtParams expertIdsCntParams = {1U, static_cast<uint32_t>(expertIdsCnt * sizeof(uint32_t)), 0U, 0U,
+    //                                                  0U};
+    // AscendC::DataCopyPadExtParams<int32_t> copyPadParams{false, 0U, 0U, 0U};
+    // AscendC::DataCopyPad(expertIdsTensor_, expertIdsGMTensor_, expertIdsCntParams, copyPadParams);
+    // AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+    // AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+
+    // CalAndSendTokenCount();
+    // AscendC::PipeBarrier<PIPE_ALL>();
+    // if (hasShareExpert) {
+    //     sendToShareAivNum = sendOtherCoreNum / (axisK + 1);  // 均等分，取整
+    //     if (sendToShareAivNum == 0) {
+    //         sendToShareAivNum = 1;
+    //     }
+    // }
+    // sendToMoeAivNum = sendOtherCoreNum - sendToShareAivNum;
+    sendToMoeAivNum = sendOtherCoreNum;
+
+    // AscendC::SetDeqScale((half)1.000000e+00f);
+    // if (hasShareExpert && sendOtherCoreIdx >= sendToMoeAivNum) {
+    //     SendToShareExprt(gmX, gmX1, gmX1Scale);
+    // } else {
+    //     SendToMoeExprt(gmX, gmExpandIdx);
+    // }
+    SendToMoeExprt(gmX, gmExpandIdx, false, ubOffset);
     AscendC::PipeBarrier<PIPE_ALL>();
 }
 
@@ -1222,49 +1268,97 @@ void RecvCoreFunc(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, GM_ADD
     RecvCount(ubOffset);
 
     // 先按本地专家分核，再在专家内进一步分核
-    uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;
-    uint32_t recvCoreNumPerGroup = recvCoreNum / localExpertNum;  // 每个group由若干核处理，这里先假定可以整除且不为0
-    uint32_t recvRankNumPerCore = epRankSize / recvCoreNumPerGroup;  // 每个核处理的rank数量
-    uint32_t remainderRankNum = epRankSize % recvCoreNumPerGroup;
-
-    uint32_t groupId = recvCoreIdx / recvCoreNumPerGroup;                   // 当前核处理的是哪个group
-    uint32_t recvCoreIdxInGroup = recvCoreIdx % recvCoreNumPerGroup;        // 当前核处理的是group中第几个
-    uint32_t startRankIdInGroup = recvRankNumPerCore * recvCoreIdxInGroup;  // 当前核处理的起始rank
-    if (recvCoreIdxInGroup < remainderRankNum) {
-        recvRankNumPerCore += 1;
-        startRankIdInGroup += recvCoreIdxInGroup;
+    uint32_t taskPerExpert = epRankSize;
+    uint32_t taskPerCore = taskPerExpert / recvCoreNum;  // 每个核处理的task数量
+    uint32_t startRankIdInExpert = recvCoreIdx * taskPerCore;
+    uint32_t reaminTaskNum = taskPerExpert % recvCoreNum;
+    if (recvCoreIdx < reaminTaskNum) {
+        taskPerCore += 1;
+        startRankIdInExpert += recvCoreIdx;
     } else {
-        startRankIdInGroup += remainderRankNum;
+        startRankIdInExpert += reaminTaskNum;
     }
-    uint32_t endRankIdInGroup = startRankIdInGroup + recvRankNumPerCore;
-    uint32_t startRankId = epRankSize * groupId + startRankIdInGroup;
-    uint32_t endRankId = epRankSize * groupId + endRankIdInGroup;
+    uint32_t endRankIdInExpert = startRankIdInExpert + taskPerCore;
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
+    for (uint32_t localExpertId = 0; localExpertId < localExpertNum; ++localExpertId) {
+        uint32_t startRankId = localExpertId * taskPerExpert + startRankIdInExpert;
+        uint32_t endRankId = localExpertId * taskPerExpert + endRankIdInExpert;
 
-    uint32_t coreTokenCount = 0;
+        uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;
+        uint32_t recvRankNumPerCore = taskPerCore;  // 每个核处理的rank数量
 
-    if (startRankId < recvExpertNum) {
-        // 计算前缀和，以及接收token。这里有隐含约束，下面两个函数与RecvCount的ubOffset入参应保持一致，这样才能拿到有效数据
-        GetCumSum(startRankId, recvExpertNum, ubOffset, gmOutputRecvCount);
-        RecvToken(gmX1, gmX1Scale, gmEpSendCount, coreTokenCount, startRankId, endRankId, recvRankNumPerCore, ubOffset);
+        uint32_t coreTokenCount = 0;
+        if (startRankIdInExpert < taskPerExpert) {
+            // 计算前缀和，以及接收token。这里有隐含约束，下面两个函数与RecvCount的ubOffset入参应保持一致，这样才能拿到有效数据
+            GetCumSum(startRankId, recvExpertNum, ubOffset, gmOutputRecvCount);
+            RecvToken(gmX1, gmX1Scale, gmEpSendCount, coreTokenCount, startRankId, endRankId, recvRankNumPerCore,
+                      ubOffset);
+        }
+        // 接收完成，通过写GM告知C核和计算V核
+        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::LocalTensor<int32_t> tmpLocalTensor = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+        ubOffset += CEIL_UP(UB_BLOCK_SIZE);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+        tmpLocalTensor.SetValue(CV_FLAG_INDEX, vToCFlag);
+        tmpLocalTensor.SetValue(GROUP_ID_INDEX, localExpertId);
+        tmpLocalTensor.SetValue(SELF_COUNT_INDEX, coreTokenCount);
+        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+
+        AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
+        groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET));
+        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+        AscendC::SetAtomicAdd<int32_t>();
+        // 用原子加，各个核收到的token数量加一起，就是专家收到的token数量
+        AscendC::DataCopy(groupTokenNumStateTensor[groupId * GROUP_INFO_SIZE], tmpLocalTensor, INT32_COUNT_PER_BLOCK);
+        AscendC::SetAtomicNone();
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
 
-    // 接收完成，通过写GM告知C核和计算V核
-    AscendC::PipeBarrier<PIPE_ALL>();
-    AscendC::LocalTensor<int32_t> tmpLocalTensor = resource.ubBuf.template GetBufferByByte<int32_t>(0);
-    ubOffset += CEIL_UP(UB_BLOCK_SIZE);
-    tmpLocalTensor.SetValue(CV_FLAG_INDEX, vToCFlag);
-    tmpLocalTensor.SetValue(GROUP_ID_INDEX, groupId);
-    tmpLocalTensor.SetValue(SELF_COUNT_INDEX, coreTokenCount);
-    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+    // uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;
+    // uint32_t recvCoreNumPerGroup = recvCoreNum / localExpertNum;  // 每个group由若干核处理，这里先假定可以整除且不为0
+    // uint32_t recvRankNumPerCore = epRankSize / recvCoreNumPerGroup;  // 每个核处理的rank数量
+    // uint32_t remainderRankNum = epRankSize % recvCoreNumPerGroup;
 
-    AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
-    groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET));
-    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
-    AscendC::SetAtomicAdd<int32_t>();
-    // 用原子加，各个核收到的token数量加一起，就是专家收到的token数量
-    AscendC::DataCopy(groupTokenNumStateTensor[groupId * GROUP_INFO_SIZE], tmpLocalTensor, INT32_COUNT_PER_BLOCK);
-    AscendC::SetAtomicNone();
-    AscendC::PipeBarrier<PIPE_ALL>();
+    // uint32_t groupId = recvCoreIdx / recvCoreNumPerGroup;                   // 当前核处理的是哪个group
+    // uint32_t recvCoreIdxInGroup = recvCoreIdx % recvCoreNumPerGroup;        // 当前核处理的是group中第几个
+    // uint32_t startRankIdInGroup = recvRankNumPerCore * recvCoreIdxInGroup;  // 当前核处理的起始rank
+    // if (recvCoreIdxInGroup < remainderRankNum) {
+    //     recvRankNumPerCore += 1;
+    //     startRankIdInGroup += recvCoreIdxInGroup;
+    // } else {
+    //     startRankIdInGroup += remainderRankNum;
+    // }
+    // uint32_t endRankIdInGroup = startRankIdInGroup + recvRankNumPerCore;
+    // uint32_t startRankId = epRankSize * groupId + startRankIdInGroup;
+    // uint32_t endRankId = epRankSize * groupId + endRankIdInGroup;
+
+    // uint32_t coreTokenCount = 0;
+
+    // if (startRankId < recvExpertNum) {
+    //     // 计算前缀和，以及接收token。这里有隐含约束，下面两个函数与RecvCount的ubOffset入参应保持一致，这样才能拿到有效数据
+    //     GetCumSum(startRankId, recvExpertNum, ubOffset, gmOutputRecvCount);
+    //     RecvToken(gmX1, gmX1Scale, gmEpSendCount, coreTokenCount, startRankId, endRankId, recvRankNumPerCore, ubOffset);
+    // }
+
+    // // 接收完成，通过写GM告知C核和计算V核
+    // AscendC::PipeBarrier<PIPE_ALL>();
+    // AscendC::LocalTensor<int32_t> tmpLocalTensor = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+    // ubOffset += CEIL_UP(UB_BLOCK_SIZE);
+    // tmpLocalTensor.SetValue(CV_FLAG_INDEX, vToCFlag);
+    // tmpLocalTensor.SetValue(GROUP_ID_INDEX, groupId);
+    // tmpLocalTensor.SetValue(SELF_COUNT_INDEX, coreTokenCount);
+    // AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+
+    // AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
+    // groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET));
+    // AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+    // AscendC::SetAtomicAdd<int32_t>();
+    // // 用原子加，各个核收到的token数量加一起，就是专家收到的token数量
+    // AscendC::DataCopy(groupTokenNumStateTensor[groupId * GROUP_INFO_SIZE], tmpLocalTensor, INT32_COUNT_PER_BLOCK);
+    // AscendC::SetAtomicNone();
+    // AscendC::PipeBarrier<PIPE_ALL>();
 }
 
 ACT_DEVICE
@@ -1299,7 +1393,7 @@ void CompCoreFunc(GM_ADDR gmCVSwapBuff, __gm__ ElementScale *gmScale, __gm__ Ele
                 AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                                   AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
                 __asm__ __volatile__("");
-                if (groupTokenNumStateTensor.GetValue(0) == coreNumPerGroup * vToCFlag) {
+                if (groupTokenNumStateTensor.GetValue(0) ==  * vToCFlag) {
                     break;
                 }
             }
@@ -1372,13 +1466,13 @@ void AivInitParams(Params const &params)
     isCompCore = (aivIdx % subBlockNum) == 0;  // 偶数核做计算
     compCoreNum = aiCoreGroupNum;
     compCoreIdx = aiCoreGroupIdx;
-    // 单卡单专家所有核先发再收（当前走浅融合，不走这里）
-    isRecvCore = true;
-    isSendCore = true;
-    recvCoreIdx = aivIdx;
-    sendCoreIdx = aivIdx;
-    sendCoreNum = aivNum;
-    recvCoreNum = aivNum;
+    // // 单卡单专家所有核先发再收（当前走浅融合，不走这里）
+    // isRecvCore = true;
+    // isSendOtherCore = true;
+    // recvCoreIdx = aivIdx;
+    // sendOtherCoreIdx = aivIdx;
+    // sendOtherCoreNum = aivNum;
+    // recvCoreNum = aivNum;
 
     moeExpertNumPerRank = params.moeExpertNumPerRank;
 
@@ -1392,15 +1486,25 @@ void AivInitParams(Params const &params)
     moeExpertNum = params.moeExpertNum;
     tokenLength = params.tokenLen;
 
-    // 单卡多专家改为一半发一半收
-    if (localExpertNum > 1) {
-        isRecvCore = ((aivIdx % ODD_EVEN_BASE) == 0);  // 偶数核接收
-        isSendCore = ((aivIdx % ODD_EVEN_BASE) == 1);  // 基数核发送
-        recvCoreIdx = aivIdx / subBlockNum;
-        sendCoreIdx = aivIdx / subBlockNum;
-        sendCoreNum = aiCoreGroupNum;
-        recvCoreNum = aiCoreGroupNum;
-    }
+    // // 单卡多专家改为一半发一半收
+    // if (localExpertNum > 1) {
+    //     isRecvCore = ((aivIdx % ODD_EVEN_BASE) == 0);  // 偶数核接收
+    //     isSendOtherCore = ((aivIdx % ODD_EVEN_BASE) == 1);  // 基数核发送
+    //     recvCoreIdx = aivIdx / subBlockNum;
+    //     sendOtherCoreIdx = aivIdx / subBlockNum;
+    //     sendOtherCoreNum = aiCoreGroupNum;
+    //     recvCoreNum = aiCoreGroupNum;
+    // }
+
+    isRecvCore = ((aivIdx % ODD_EVEN_BASE) == 0) && (aivIdx / 2 >= SEND_OTHER_E_CORE_NUM); // 偶数核的后8个接收
+    recvCoreNum = RECV_CORE_NUM;
+    recvCoreIdx = aivIdx / ODD_EVEN_BASE - SEND_OTHER_E_CORE_NUM;
+    isSendOtherCore = ((aivIdx % ODD_EVEN_BASE) == 0) && (aivIdx / 2 < SEND_OTHER_E_CORE_NUM); // 偶数核的前16个发送
+    sendOtherCoreNum = SEND_OTHER_E_CORE_NUM;
+    sendOtherCoreIdx = aivIdx / ODD_EVEN_BASE;
+    isSendE1Core = ! isRecvCore;
+    sendE1CoreNum = aivNum - RECV_CORE_NUM;
+    sendE1CoreIdx = aivIdx / ODD_EVEN_BASE + (aivIdx % ODD_EVEN_BASE == 0 ? 0 : aiCoreGroupNum);
 
     hOutSize = tokenLength * sizeof(int8_t);
     scaleParamPad = TOKEN_EXTRA_SPACE;  // 预留512B给量化参数，实际只使用了4B(fp32)
@@ -1522,8 +1626,12 @@ ACT_DEVICE void operator()<AscendC::AIV>(Params const &params)
 {
     AivInitParams(params);
     AivInitState();
-    if (isSendCore) {
-        SendCoreFunc((GM_ADDR)params.gmX, (GM_ADDR)params.gmexpertIds, (GM_ADDR)params.ptrA,
+    if (isSendE1Core) {
+        SendE1CoreFunc((GM_ADDR)params.gmX, (GM_ADDR)params.gmexpertIds, (GM_ADDR)params.ptrA,
+                       (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmExpandIdx);
+    }
+    if (isSendOtherCore) {
+        SendOtherCoreFunc((GM_ADDR)params.gmX, (GM_ADDR)params.gmexpertIds, (GM_ADDR)params.ptrA,
                      (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmExpandIdx);
     }
     if (isRecvCore) {
@@ -1653,7 +1761,8 @@ uint64_t winDataSizeOffset{0};
 int64_t ubOffset;
 
 // 分核相关
-bool isSendCore{false};
+bool isSendOtherCore{false};
+bool isSendE1Core{false};
 bool isRecvCore{false};
 bool isCompCore{false};  // 参与计算deq_swiglu
 uint32_t aiCoreGroupNum{0};
@@ -1661,12 +1770,14 @@ uint32_t aiCoreGroupIdx{0};
 uint32_t subBlockNum{0};
 uint32_t aicNum{0};
 uint32_t aivNum{0};
-uint32_t sendCoreNum{0};
+uint32_t sendOtherCoreNum{0};
+uint32_t sendE1CoreNum{0};
 uint32_t recvCoreNum{0};
 uint32_t compCoreNum{0};
 uint32_t aivIdx{0};
 uint32_t aicIdx{0};
-uint32_t sendCoreIdx{0};
+uint32_t sendOtherCoreIdx{0};
+uint32_t sendE1CoreIdx{0};
 uint32_t recvCoreIdx{0};
 uint32_t compCoreIdx{0};
 uint32_t aivStateGlobalCoreIdx{0};

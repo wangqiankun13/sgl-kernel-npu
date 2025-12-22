@@ -67,6 +67,7 @@ public:
     __aicore__ inline void Process();
 
 private:
+    __aicore__ inline void FillTriple(LocalTensor<ExpandXOutType> &xOutTensor, uint32_t tokenIndex, uint32_t k);
     __aicore__ inline void SendToSharedExpert();
     __aicore__ inline void SendToMoeExpert();
     __aicore__ inline void AlltoAllDispatch();
@@ -116,6 +117,7 @@ private:
     GlobalTensor<float> scalesGMTensor_;
     GlobalTensor<ExpandXOutType> expandXOutGMTensor_;
     GlobalTensor<float> dynamicScalesOutGMTensor_;
+    GlobalTensor<int32_t> expandIdxOutGMTensor_;
     GlobalTensor<int64_t> expertTokenNumsOutGMTensor_;
     GlobalTensor<ExpandXOutType> windowInQuantTensor_;
     GlobalTensor<int32_t> windowInstatusTensor_;
@@ -128,6 +130,7 @@ private:
     LocalTensor<XType> xInTensor_;
     LocalTensor<ExpandXOutType> xOutTensor_;
     LocalTensor<float> xOutFp32Tensor_;
+    LocalTensor<int32_t> xOutInt32Tensor_;
     LocalTensor<int32_t> expertCountTensor_;
     LocalTensor<int32_t> expertIdsTensor_;
     LocalTensor<int32_t> receivestatusTensor_;
@@ -150,7 +153,6 @@ private:
     TQue<QuePosition::VECIN, 1> xInQueue_;                         // 量化使用，量化前的输入
     TQue<QuePosition::VECOUT, 1> xOutQueue_;                       // 量化使用，量化后的输出
     GM_ADDR expandXOutGM_;
-    GM_ADDR expandIdxOutGM_;
     GM_ADDR expertTokenNumsOutGM_;  // 这个输出没有使用
     GM_ADDR sendCountsOutGM_;
     GM_ADDR outputRecvCountGM_;
@@ -186,6 +188,7 @@ private:
     uint32_t hSize_{0};
     uint32_t hOutSize_{0};
     uint32_t hCommuSize_{0};
+    uint32_t tokenQuantAlign_{0};
     uint32_t scaleParamPad_{0};
     uint32_t axisHCommu_{0};
     uint32_t startExpertId_;
@@ -274,6 +277,7 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::Init(
     expertIdsGMTensor_.SetGlobalBuffer((__gm__ int32_t *)expertIds);
     expandXOutGMTensor_.SetGlobalBuffer((__gm__ ExpandXOutType *)expandXOut);
     dynamicScalesOutGMTensor_.SetGlobalBuffer((__gm__ float *)dynamicScalesOut);
+    expandIdxOutGMTensor_.SetGlobalBuffer((__gm__ int32_t *)expandIdxOut);
     expertTokenNumsOutGMTensor_.SetGlobalBuffer((__gm__ int64_t *)expertTokenNumsOut);
     windowInQuantTensor_.SetGlobalBuffer((__gm__ ExpandXOutType *)windowGM_);
     windowInstatusTensor_.SetGlobalBuffer((__gm__ int32_t *)(statusSpaceGm_));
@@ -288,14 +292,15 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::Init(
         winTpEpCntGMTensor_.SetGlobalBuffer((__gm__ int32_t *)(tpStatusWindowGM_ + TP_STATE_SIZE));
     }
     expandXOutGM_ = expandXOut;
-    expandIdxOutGM_ = expandIdxOut;    // 无GlobalTensor
     sendCountsOutGM_ = sendCountsOut;  // 无GlobalTensor
     outputRecvCountGM_ = outputRecvCount;
     sendTpCountOutGM_ = tpSendCountsOut;
     isQuant_ = StaticQuant | DynamicQuant;
     hSize_ = axisH_ * sizeof(XType);
     hOutSize_ = axisH_ * sizeof(ExpandXOutType);  // 如有量化，需要量化后通信
-    scaleParamPad_ = (isQuant_ ? 128 : 0);        // 预留128B给量化参数，实际只使用了4B(fp32)
+    uint32_t hScaleSizeAlign = hOutSize_ + UB_ALIGN;
+    tokenQuantAlign_ = hScaleSizeAlign / sizeof(int32_t);
+    scaleParamPad_ = 128;        // 预留128B，前32B给量化参数，第二个32B给三元组
     hCommuSize_ = hOutSize_ + scaleParamPad_;
     axisHCommu_ = hCommuSize_ / sizeof(ExpandXOutType);
     if (sharedExpertRankNum_ != 0) {                 // 后面的卡才需要发给共享专家发数据
@@ -376,6 +381,18 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::Quant
 }
 
 template <TemplateDispatchTypeClass>
+__aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::FillTriple(
+    LocalTensor<ExpandXOutType> &xOutTensor, uint32_t tokenIndex, uint32_t k)
+{
+    SyncFunc<AscendC::HardEvent::MTE3_S>();
+    LocalTensor<int32_t> xOutTint32 = xOutTensor.template ReinterpretCast<int32_t>();
+    xOutTint32(tokenQuantAlign_) = epRankId_;
+    xOutTint32(tokenQuantAlign_ + 1) = tokenIndex;
+    xOutTint32(tokenQuantAlign_ + 2) = k;
+    SyncFunc<AscendC::HardEvent::S_MTE3>();
+}
+
+template <TemplateDispatchTypeClass>
 __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::SendToSharedExpert()
 {
     uint32_t sendTokenNum = axisBS_ / sharedUsedAivNum_;       // 每个aiv需要发送的token数
@@ -408,6 +425,7 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::SendT
             xInTensor_ = xInQueue_.DeQue<XType>();
             xOutTensor_ = xOutQueue_.AllocTensor<ExpandXOutType>();
             QuantProcess(0);
+            FillTriple(xOutTensor_, tokenIndex, 8);
             xOutQueue_.EnQue(xOutTensor_);
 
             xOutTensor_ = xOutQueue_.DeQue<ExpandXOutType>();
@@ -427,6 +445,7 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::SendT
         } else {
             xTmpTensor_ = xQueue_.AllocTensor<ExpandXOutType>();
             DataCopy(xTmpTensor_, xGMTensor_[tokenIndex * axisH_], axisH_);  // 约束对齐
+            FillTriple(xTmpTensor_, tokenIndex, 8);
             xQueue_.EnQue(xTmpTensor_);
             xTmpTensor_ = xQueue_.DeQue<ExpandXOutType>();
             if (isShareExpertRank_) {
@@ -476,6 +495,7 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::SendT
             xOutTensor_ = xOutQueue_.AllocTensor<ExpandXOutType>();
             uint32_t expertIndex = sharedExpertRankNum_ != 0 ? (dstExpertId + 1) : dstExpertId;
             QuantProcess(expertIndex);
+            FillTriple(xOutTensor_, tokenIndex / axisK_, tokenIndex % axisK_);
             xOutQueue_.EnQue(xOutTensor_);
 
             xOutTensor_ = xOutQueue_.DeQue<ExpandXOutType>();
@@ -486,16 +506,10 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::SendT
             DataCopy(xTmpTensor_, xGMTensor_[tokenIndex / axisK_ * axisH_], axisH_);  // 约束对齐
             xQueue_.EnQue(xTmpTensor_);
             xTmpTensor_ = xQueue_.DeQue<ExpandXOutType>();
+            FillTriple(xTmpTensor_, tokenIndex / axisK_, tokenIndex % axisK_);
             DataCopy(dstWinGMTensor, xTmpTensor_, axisHCommu_);  // 约束对齐
             xQueue_.FreeTensor<ExpandXOutType>(xTmpTensor_);
         }
-    }
-    if (aivId_ == (moeUsedAivNum_ - 1) && (!enableAivOpt_)) {
-        // 不启用循环优化时，这里才需要写出结果
-        GlobalTensor<int32_t> expandIdxGMTensor;
-        expandIdxGMTensor.SetGlobalBuffer((__gm__ int32_t *)expandIdxOutGM_);
-        DataCopyExtParams expertIdsCntParams = {1U, static_cast<uint32_t>(expertIdsCnt * sizeof(uint32_t)), 0U, 0U, 0U};
-        DataCopyPad(expandIdxGMTensor, expertCountTensor_, expertIdsCntParams);
     }
 }
 
@@ -544,7 +558,6 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::Allto
         }
 
         // 计算完成后，下标为的i的行为下标为i+1的token在远端的偏移，最后一行为总count
-        GlobalTensor<int32_t> expandIdxGMTensor;
         if (aivId_ < moeUsedAivNum_) {
             SyncFunc<AscendC::HardEvent::V_S>();
             for (int row = startTokenRow; row < endTokenRow; ++row) {
@@ -556,10 +569,6 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::Allto
                     expertCountTensor_(row * axisK_ + expertIndex) =
                         (int32_t)tableLocalTensor_(row * moeExpertRankNumAligned_ + expertId);
                 }
-                SyncFunc<AscendC::HardEvent::S_MTE3>();
-                expandIdxGMTensor.SetGlobalBuffer(
-                    (__gm__ int32_t *)(expandIdxOutGM_ + row * axisK_ * sizeof(uint32_t)));
-                DataCopy(expandIdxGMTensor, expertCountTensor_[row * axisK_], axisK_);
             }
         }
 
@@ -850,6 +859,7 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::Local
     uint32_t index = 0;
     uint32_t beginIdx = 0;
     DataCopyExtParams dataCopyParamsFloat = {1U, sizeof(float), 0U, 0U, 0U};
+    DataCopyExtParams expandIdxParams = {1U, static_cast<uint32_t>(TOKEN_EXTRA_INFO_NUM * sizeof(int32_t)), 0U, 0U, 0U};
     for (uint32_t index = startExpertId_; index < endExpertId_; index++) {
         uint32_t i = index - startExpertId_;
         if (i > 0) {
@@ -892,6 +902,8 @@ __aicore__ inline void CamMoeDistributeDispatch<TemplateDispatchTypeFunc>::Local
                             dataCopyParamsFloat);
                 pipe_barrier(PIPE_ALL);
             }
+            xOutInt32Tensor_ = xTmpTensor_.template ReinterpretCast<int32_t>();
+            DataCopyPad(expandIdxOutGMTensor_[(beginIdx + j) * TOKEN_EXTRA_INFO_NUM], xOutInt32Tensor_[tokenQuantAlign_], expandIdxParams);
             if constexpr (IsNeedAllgater) {
                 DataCopy(winTpGatherOutGMTensor_[(beginIdx + j) * axisHCommu_], xTmpTensor_, axisHCommu_);
             }

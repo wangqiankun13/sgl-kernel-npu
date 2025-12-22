@@ -770,7 +770,6 @@ public:
         yFp32Tensor.SetValue(tokenLength / sizeof(float), float(1.0) / dynamicQuantScale);
         yInt32Tensor.SetValue(tokenLength / sizeof(int32_t) + 1, tokenFlag);
         AscendC::SetFlag<AscendC::HardEvent::S_V>(0);
-        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(0);
 
         AscendC::Muls(xFp32TmpTensor, xFp32TmpTensor, dynamicQuantScale, tokenLength);
@@ -805,6 +804,7 @@ public:
         AscendC::LocalTensor<XType> xInTensor[BUFFER_NUM];
         AscendC::LocalTensor<int8_t> yInt8Tensor[BUFFER_NUM];
         AscendC::LocalTensor<float> yFp32Tensor[BUFFER_NUM];
+        AscendC::LocalTensor<int32_t> yInt32Tensor[BUFFER_NUM];
 
         AscendC::GlobalTensor<XType> srcWinGMTensor;  // token输入
         srcWinGMTensor.SetGlobalBuffer((__gm__ XType *)gmX);
@@ -815,9 +815,11 @@ public:
         ubOffset += CEIL_UP(tokenLength * sizeof(XType));
         yInt8Tensor[0] = resource.ubBuf.template GetBufferByByte<int8_t>(ubOffset);
         yFp32Tensor[0] = yInt8Tensor[0].template ReinterpretCast<float>();
+        yInt32Tensor[0] = yInt8Tensor[0].template ReinterpretCast<int32_t>();
         ubOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
         yInt8Tensor[1] = resource.ubBuf.template GetBufferByByte<int8_t>(ubOffset);
         yFp32Tensor[1] = yInt8Tensor[1].template ReinterpretCast<float>();
+        yInt32Tensor[1] = yInt8Tensor[1].template ReinterpretCast<int32_t>();
         ubOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
         AscendC::GlobalTensor<int8_t> dstWinGMTensor;  // token输出
         AscendC::GlobalTensor<int8_t> expandXOutGlobal;
@@ -852,6 +854,10 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
                 QuantToken(xInTensor[index], yInt8Tensor[index], ubOffset);
+                yInt32Tensor[index].SetValue(tokenLength / sizeof(int32_t) + INT32_COUNT_PER_BLOCK + 0, (int32_t)epRankId);
+                yInt32Tensor[index].SetValue(tokenLength / sizeof(int32_t) + INT32_COUNT_PER_BLOCK + 1, (int32_t)tokenIndex / axisK);
+                yInt32Tensor[index].SetValue(tokenLength / sizeof(int32_t) + INT32_COUNT_PER_BLOCK + 2, (int32_t)tokenIndex % axisK);
+                AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
                 AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
 
@@ -883,7 +889,7 @@ public:
     }
 
     ACT_DEVICE
-    void SendToMoeExprt(GM_ADDR gmX, GM_ADDR gmExpandIdx)
+    void SendToMoeExprt(GM_ADDR gmX)
     {
         // 给路由专家发送token
         uint32_t sendTokenNum = expertIdsCnt / sendToMoeAivNum;
@@ -911,7 +917,7 @@ public:
 
         AscendC::LocalTensor<XType> xInTensor[BUFFER_NUM];
         AscendC::LocalTensor<int8_t> yInt8Tensor[BUFFER_NUM];
-        AscendC::LocalTensor<float> yFp32Tensor[BUFFER_NUM];
+        AscendC::LocalTensor<int32_t> yInt32Tensor[BUFFER_NUM];
 
         AscendC::GlobalTensor<XType> srcWinGMTensor;  // token输入
         srcWinGMTensor.SetGlobalBuffer((__gm__ XType *)gmX);
@@ -921,8 +927,10 @@ public:
         xInTensor[1] = resource.ubBuf.template GetBufferByByte<XType>(ubOffset);
         ubOffset += CEIL_UP(tokenLength * sizeof(XType));
         yInt8Tensor[0] = resource.ubBuf.template GetBufferByByte<int8_t>(ubOffset);
+        yInt32Tensor[0] = yInt8Tensor[0].template ReinterpretCast<int32_t>();
         ubOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
         yInt8Tensor[1] = resource.ubBuf.template GetBufferByByte<int8_t>(ubOffset);
+        yInt32Tensor[1] = yInt8Tensor[1].template ReinterpretCast<int32_t>();
         ubOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
         AscendC::GlobalTensor<int8_t> dstWinGMTensor;  // token输出
         // 输入输出开double buffer
@@ -959,6 +967,10 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
                 QuantToken(xInTensor[index], yInt8Tensor[index], ubOffset);
+                yInt32Tensor[index].SetValue(tokenLength / sizeof(int32_t) + INT32_COUNT_PER_BLOCK + 0, (int32_t)epRankId);
+                yInt32Tensor[index].SetValue(tokenLength / sizeof(int32_t) + INT32_COUNT_PER_BLOCK + 1, (int32_t)tokenIndex / axisK);
+                yInt32Tensor[index].SetValue(tokenLength / sizeof(int32_t) + INT32_COUNT_PER_BLOCK + 2, (int32_t)tokenIndex % axisK);
+                AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
 
                 AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
@@ -976,21 +988,13 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(1);  // MTE2等MTE3
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
-
-        AscendC::GlobalTensor<int32_t> expandIdxGMTensor;
-        expandIdxGMTensor.SetGlobalBuffer((__gm__ int32_t *)gmExpandIdx + startTokenId);
-        AscendC::DataCopyExtParams expertIdsCntParams = {1U, static_cast<uint32_t>(sendTokenNum * sizeof(uint32_t)), 0U,
-                                                         0U, 0U};
-        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
-        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
-        AscendC::DataCopyPad(expandIdxGMTensor, expertCountTensor, expertIdsCntParams);
 #ifndef SEND_TOKEN_RETURN
     }
 #endif
 }
 
 ACT_DEVICE void
-SendCoreFunc(GM_ADDR gmX, GM_ADDR gmExpertIds, GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmExpandIdx)
+SendCoreFunc(GM_ADDR gmX, GM_ADDR gmExpertIds, GM_ADDR gmX1, GM_ADDR gmX1Scale)
 {
     ubOffset = 0;
     expertIdsCnt = axisBS * axisK;
@@ -1021,7 +1025,7 @@ SendCoreFunc(GM_ADDR gmX, GM_ADDR gmExpertIds, GM_ADDR gmX1, GM_ADDR gmX1Scale, 
     if (hasShareExpert && sendCoreIdx >= sendToMoeAivNum) {
         SendToShareExprt(gmX, gmX1, gmX1Scale);
     } else {
-        SendToMoeExprt(gmX, gmExpandIdx);
+        SendToMoeExprt(gmX);
     }
     AscendC::PipeBarrier<PIPE_ALL>();
 }
@@ -1123,7 +1127,7 @@ void GetCumSum(int32_t startRankId, int32_t recvExpertNum, int64_t ubOffset, GM_
 }
 
 ACT_DEVICE
-void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t &coreTokenCount, uint32_t startRankId,
+void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, GM_ADDR gmExpandIdx, uint32_t &coreTokenCount, uint32_t startRankId,
                uint32_t endRankId, uint32_t recvRankNumPerCore, int64_t ubOffset)
 {
     // 接收token
@@ -1140,6 +1144,7 @@ void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t 
     AscendC::LocalTensor<int8_t> xTmpTensor_ = resource.ubBuf.template GetBufferByByte<int8_t>(subUbOffset);
     subUbOffset += CEIL_UP(axisHCommu * sizeof(int8_t));
     AscendC::LocalTensor<float> xOutFp32Tensor_ = xTmpTensor_.template ReinterpretCast<float>();
+    AscendC::LocalTensor<int32_t> xOutInt32Tensor_ = xTmpTensor_.template ReinterpretCast<int32_t>();
     AscendC::LocalTensor<int32_t> tmpLocalTensor = resource.ubBuf.template GetBufferByByte<int32_t>(subUbOffset);
     subUbOffset += CEIL_UP(UB_BLOCK_SIZE);
     AscendC::LocalTensor<int32_t> gatherMaskOutCountTensor = (gatherMaskOutTensor.template ReinterpretCast<int32_t>());
@@ -1148,6 +1153,9 @@ void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t 
     AscendC::GlobalTensor<int8_t> expandXOutGlobal;
     AscendC::GlobalTensor<float> dynamicScalesOutGMTensor_;
     dynamicScalesOutGMTensor_.SetGlobalBuffer((__gm__ float *)(gmX1Scale));
+    AscendC::GlobalTensor<int32_t> expandIdxGMTensor;
+    expandIdxGMTensor.SetGlobalBuffer((__gm__ int32_t *)gmExpandIdx);
+    AscendC::DataCopyExtParams expandIdxCntParams = {1U, static_cast<uint32_t>(TOKEN_EXTRA_INFO_NUM * sizeof(uint32_t)), 0U, 0U, 0U};
     uint32_t beginIdx = 0;
     for (uint32_t index = startRankId; index < endRankId; index++) {
         uint32_t i = index - startRankId;
@@ -1198,6 +1206,7 @@ void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t 
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
             AscendC::DataCopyPad(dynamicScalesOutGMTensor_[beginIdx + j], xOutFp32Tensor_[tokenLength / sizeof(float)],
                                  dataCopyParamsFloat);
+            AscendC::DataCopyPad(expandIdxGMTensor[(beginIdx + j) * TOKEN_EXTRA_INFO_NUM], xOutInt32Tensor_[tokenLength / sizeof(int32_t) + INT32_COUNT_PER_BLOCK], expandIdxCntParams);
             AscendC::DataCopy(expandXOutGlobal, xTmpTensor_, tokenLength);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
         }
@@ -1216,7 +1225,7 @@ void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t 
 }
 
 ACT_DEVICE
-void RecvCoreFunc(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, GM_ADDR gmOutputRecvCount)
+void RecvCoreFunc(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, GM_ADDR gmOutputRecvCount, GM_ADDR gmExpandIdx)
 {
     ubOffset = 0;
     RecvCount(ubOffset);
@@ -1245,7 +1254,7 @@ void RecvCoreFunc(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, GM_ADD
     if (startRankId < recvExpertNum) {
         // 计算前缀和，以及接收token。这里有隐含约束，下面两个函数与RecvCount的ubOffset入参应保持一致，这样才能拿到有效数据
         GetCumSum(startRankId, recvExpertNum, ubOffset, gmOutputRecvCount);
-        RecvToken(gmX1, gmX1Scale, gmEpSendCount, coreTokenCount, startRankId, endRankId, recvRankNumPerCore, ubOffset);
+        RecvToken(gmX1, gmX1Scale, gmEpSendCount, gmExpandIdx, coreTokenCount, startRankId, endRankId, recvRankNumPerCore, ubOffset);
     }
 
     // 接收完成，通过写GM告知C核和计算V核
@@ -1524,11 +1533,11 @@ ACT_DEVICE void operator()<AscendC::AIV>(Params const &params)
     AivInitState();
     if (isSendCore) {
         SendCoreFunc((GM_ADDR)params.gmX, (GM_ADDR)params.gmexpertIds, (GM_ADDR)params.ptrA,
-                     (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmExpandIdx);
+                     (GM_ADDR)params.ptrPerTokenScale);
     }
     if (isRecvCore) {
         RecvCoreFunc((GM_ADDR)params.ptrA, (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmEpSendCount,
-                     (GM_ADDR)params.gmOutputRecvCount);
+                     (GM_ADDR)params.gmOutputRecvCount, (GM_ADDR)params.gmExpandIdx);
     }
 
     auto gmSwigluOutput = reinterpret_cast<__gm__ float *>(

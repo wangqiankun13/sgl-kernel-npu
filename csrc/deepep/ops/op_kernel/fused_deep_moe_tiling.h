@@ -68,6 +68,8 @@ constexpr uint32_t GMM2_SWIZZLE_DIRECTION = 0;
 
 constexpr uint32_t WORKSPACE_STAGES = 4;
 
+constexpr uint32_t TOKEN_EXTRA_INFO_NUM = 3;
+
 constexpr uint32_t EXEC_FLAG_DEEP_FUSE = (1U << 0);
 
 #endif  // FUSED_DEEP_MOE_TILING_H
